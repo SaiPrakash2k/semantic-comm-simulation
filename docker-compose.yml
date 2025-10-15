@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  receiver:
+    build: ./receiver
+    networks:
+      - semantic-net
+
+  channel:
+    build: ./channel
+    networks:
+      - semantic-net
+    depends_on:
+      - receiver
+
+  sender:
+    build: ./sender
+    networks:
+      - semantic-net
+    depends_on:
+      - channel
+
+networks:
+  semantic-net:
+    driver: bridge
