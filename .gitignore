@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+
+# Mac
+.DS_Store
+
+# Models and Checkpoints
+*.pth
+*.pt
+*.zip
+models/*.pth
+models/*.zip
+runs/
+minibatch_*.pt
+
+# Data
+data/
+images/

@@ -2,14 +2,16 @@ services:
   sender:
     build: ./sender
     volumes:
+      - ./sender:/app # Mount source code
       - ./images:/app/images:ro
       - ./runs:/app/runs
       - ./models:/app/models
       - ./sender/utils:/app/utils:ro # Mount utils to ensure it's available and up-to-date
     expose:
-      - "65500"  # <-- ADD THIS LINE
+      - "65500" # <-- ADD THIS LINE
     environment:
       - DATASET_TYPE=CIFAR10 # Options: CIFAR10, STL10, CUSTOM
+      - EXPERIMENT_STEPS=${EXPERIMENT_STEPS:-5000} # Number of steps to run the experiment (default 5000)
     # ... other sender config ...
 
   receiver:
@@ -25,7 +27,7 @@ services:
       - sender
       - channel
     # ... other receiver config ...
-    
+
   channel:
     build: ./channel
     ports:
@@ -33,3 +35,19 @@ services:
     depends_on:
       - sender
     # ... other channel config ..
+
+  edge-encoder:
+    build: ./edge_encoder
+    volumes:
+      - ./models:/app/models:ro
+      - ./sender/utils:/app/utils:ro
+    expose:
+      - "8000"
+
+  edge-decoder:
+    build: ./edge_decoder
+    volumes:
+      - ./models:/app/models:ro
+      - ./sender/utils:/app/utils:ro
+    expose:
+      - "8000"

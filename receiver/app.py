@@ -1,7 +1,7 @@
 import socket
 import torch
 import torchvision.transforms as transforms
-from utils.models import Decoder # Import custom Decoder
+from utils.models import SimpleDecoder # Import custom Decoder
 from PIL import Image
 import os
 import numpy as np
@@ -11,6 +11,7 @@ import pickle
 import logging
 from typing import Dict, Any, Optional
 from torch.utils.tensorboard import SummaryWriter
+import requests
 
 # --- Setup basic logging ---
 logging.basicConfig(level=logging.INFO,
@@ -50,22 +51,18 @@ class Receiver:
         self.deadline_tau = deadline
         self.alpha_weight = alpha
 
-        # --- Initialize Decoder ---
-        logging.info("Initializing Custom Decoder...")
-        self.decoder = Decoder(encoded_space_dim=512)
+        # --- Initialize Decoder (Simple/Local) ---
+        logging.info("Initializing Custom Decoder (Simple/Local)...")
+        self.decoder = SimpleDecoder(encoded_space_dim=512)
         
         # Load pre-trained weights if available
-        ae_weights_path = "/app/models/autoencoder_cifar10.pth"
+        ae_weights_path = "/app/models/simple_decoder.pth"
         if os.path.exists(ae_weights_path):
-            logging.info(f"Loading pre-trained Autoencoder weights from {ae_weights_path}...")
+            logging.info(f"Loading SimpleDecoder weights from {ae_weights_path}...")
             try:
                 state_dict = torch.load(ae_weights_path, map_location='cpu')
-                # Filter for decoder keys only (prefix 'decoder.')
-                # Autoencoder has self.decoder = Decoder(). So keys are 'decoder.decoder_lin...'
-                # Decoder expects 'decoder_lin...'
-                
-                decoder_state_dict = {k.replace('decoder.', ''): v for k, v in state_dict.items() if k.startswith('decoder.')}
-                self.decoder.load_state_dict(decoder_state_dict)
+                # No prefix stripping needed for standalone decoder weights
+                self.decoder.load_state_dict(state_dict)
                 logging.info("Decoder weights loaded successfully.")
             except Exception as e:
                 logging.error(f"Failed to load decoder weights: {e}")
@@ -86,6 +83,28 @@ class Receiver:
         logging.info("Initializing TensorBoard SummaryWriter...")
         self.writer = SummaryWriter(log_dir="/app/runs/receiver_logs")
         self.step_counter = 0
+
+    def _decode_edge_vector(self, vector: np.ndarray) -> torch.Tensor:
+        """Decodes vector using the Edge Decoder service."""
+        try:
+            # Send POST request
+            response = requests.post(
+                "http://edge-decoder:8000/decode",
+                json={"vector": vector.tolist()}
+            )
+            
+            if response.status_code == 200:
+                img_bytes = response.content
+                img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+                return self.preprocess(img)
+            else:
+                logging.error(f"Edge Decoder failed: {response.text}")
+                # Fallback to local decoder
+                return self._decode_vector(vector)
+                
+        except Exception as e:
+            logging.error(f"Error calling Edge Decoder: {e}")
+            return self._decode_vector(vector)
 
     def _decode_vector(self, vector: np.ndarray) -> torch.Tensor:
         """Decodes the semantic vector into an image tensor."""
@@ -208,9 +227,11 @@ class Receiver:
 
         try:
             # --- 1. Unpack Network State from Payload ---
-            # FORMAT: noise | bandwidth | pickled_payload
-            noise_bytes, rest_of_data = data.split(b'|', 1)
-            bw_bytes, pickled_payload = rest_of_data.split(b'|', 1)
+            # --- 1. Unpack Network State from Payload ---
+            # FORMAT: noise (4 bytes) | bandwidth (4 bytes) | pickled_payload
+            noise_bytes = data[0:4]
+            bw_bytes = data[4:8]
+            pickled_payload = data[8:]
 
             observed_noise = np.frombuffer(noise_bytes, dtype=np.float32)[0]
             observed_bandwidth = np.frombuffer(bw_bytes, dtype=np.float32)[0]
@@ -224,6 +245,35 @@ class Receiver:
             msg_type = message_dict['type']
             payload = message_dict['payload']
 
+            # --- SNR Calculation ---
+            snr_db = -1.0 # Default if not applicable
+            if msg_type in ["SEM_LOCAL", "SEM_EDGE"]:
+                # Payload is the NOISY vector (from Channel)
+                # We can approximate Signal Power as Mean(Vector^2)
+                # Note: This includes Noise Power too, but if SNR is high, P_rx approx P_signal
+                # Or strictly: P_rx = P_signal + P_noise
+                # P_signal = P_rx - P_noise. 
+                # P_noise = observed_noise^2
+                
+                # Let's use simple P_signal estimate from received vector for robustness
+                # (Standard practice in receiver is measuring RSSI)
+                received_vector = payload
+                p_rx = np.mean(received_vector**2)
+                p_noise = observed_noise**2
+                
+                # Avoid div by zero
+                if p_noise > 1e-9:
+                    p_signal_est = max(0.0, p_rx - p_noise) # Subtract estimated noise power
+                    if p_signal_est > 0:
+                         snr_db = 10 * np.log10(p_signal_est / p_noise)
+                    else:
+                         snr_db = 0.0 # Very low SNR
+                else:
+                    snr_db = 50.0 # High SNR cap if no noise
+                    
+                logging.info(f"SNR Calculation: P_rx={p_rx:.4f}, NoiseSigma={observed_noise:.4f}, SNR={snr_db:.2f} dB")
+
+
             # --- 3. Decode payload based on type ---
             logging.info(f"Decoding message type: {msg_type}")
             gt_image_bytes = message_dict.get('gt_image')
@@ -233,12 +283,19 @@ class Receiver:
                 gt_img_pil = Image.open(io.BytesIO(gt_image_bytes)).convert('RGB')
                 gt_image = self.preprocess(gt_img_pil) # [C, H, W] tensor
 
-            if msg_type == "SEM":
-                log_msg_type = "SEMANTIC"
+            if msg_type == "SEM_LOCAL":
+                log_msg_type = "SEM_LOCAL"
                 # Payload is the noisy vector
                 noisy_vector = payload 
-                logging.info("Running Decoder...")
+                logging.info("Running Local Decoder...")
                 reconstructed_image = self._decode_vector(noisy_vector)
+
+            elif msg_type == "SEM_EDGE":
+                log_msg_type = "SEM_EDGE"
+                # Payload is the noisy vector
+                noisy_vector = payload 
+                logging.info("Running Edge Decoder...")
+                reconstructed_image = self._decode_edge_vector(noisy_vector)
 
             elif msg_type == "RAW":
                 log_msg_type = "RAW"
@@ -277,6 +334,8 @@ class Receiver:
         self.writer.add_scalar("Performance/Reward", reward, self.step_counter)
         self.writer.add_scalar("Network/Noise", observed_noise, self.step_counter)
         self.writer.add_scalar("Network/Bandwidth", observed_bandwidth, self.step_counter)
+        if snr_db > -1.0:
+             self.writer.add_scalar("Network/SNR_dB", snr_db, self.step_counter)
             
             # Log images occasionally
         if self.step_counter % 50 == 0:

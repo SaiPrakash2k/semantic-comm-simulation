@@ -133,7 +133,7 @@ class DynamicChannel:
         try:
             message_dict: Dict[str, Any] = pickle.loads(pickled_payload)
             
-            if message_dict['type'] == "SEM":
+            if message_dict['type'] in ["SEM", "SEM_LOCAL", "SEM_EDGE"]:
                 logging.info(f"  Applying noise: {noise_level:.3f}")
                 noisy_vector = self.add_noise(message_dict['payload'])
                 message_dict['payload'] = noisy_vector
@@ -157,8 +157,8 @@ class DynamicChannel:
         noise_bytes = np.array([noise_level], dtype=np.float32).tobytes()
         bw_bytes = np.array([bandwidth_mbps], dtype=np.float32).tobytes()
         
-        # NEW FORMAT: noise | bandwidth | pickled_payload
-        message_to_forward = noise_bytes + b'|' + bw_bytes + b'|' + message_payload_bytes
+        # NEW FORMAT: noise (4b) | bandwidth (4b) | pickled_payload
+        message_to_forward = noise_bytes + bw_bytes + message_payload_bytes
         
         return message_to_forward
 

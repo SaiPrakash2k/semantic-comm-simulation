@@ -5,7 +5,7 @@ import os
 import torch
 import torchvision
 import torchvision.transforms as transforms
-from utils.models import Encoder # Import custom Encoder
+from utils.models import PretrainedMobileNetEncoder # Import custom Encoder
 from PIL import Image
 import numpy as np
 import threading
@@ -19,6 +19,8 @@ import psutil
 import queue
 import pickle
 import logging
+import requests
+import json
 from typing import Dict, Any, Tuple, List
 from torch.utils.data import Dataset
 
@@ -40,12 +42,16 @@ FEEDBACK_HOST = '0.0.0.0'
 FEEDBACK_PORT = 65500
 
 # --- DRL Agent Config ---
-ACTION_SEMANTIC = 0
+# --- DRL Agent Config ---
+ACTION_SEMANTIC_LOCAL = 0
 ACTION_RAW = 1
+ACTION_SEMANTIC_EDGE = 2
 STATE_SPACE_LOW = np.array([0.0, 0.0, 50.0, 0.0, 1.0], dtype=np.float32)
 STATE_SPACE_HIGH = np.array([100.0, 100.0, 2048.0, 0.5, 20.0], dtype=np.float32)
 
-TOTAL_TRAINING_STEPS = 100000
+
+# Default to 100,000 if not set
+TOTAL_TRAINING_STEPS = int(os.environ.get('EXPERIMENT_STEPS', 100000))
 BATCH_SIZE = 32
 REPLAY_BUFFER_SIZE = 10000
 LEARNING_STARTS = 100
@@ -63,9 +69,17 @@ class DummyEnv(gym.Env):
             high=STATE_SPACE_HIGH,
             dtype=np.float32
         )
-        self.action_space = spaces.Discrete(2) # 0=SEMANTIC, 1=RAW
-    def step(self, action): pass
-    def reset(self, seed=None, options=None): pass
+        self.action_space = spaces.Discrete(3) # 0=SEMANTIC_LOCAL, 1=RAW, 2=SEMANTIC_EDGE
+    def step(self, action):
+        # Return valid (obs, reward, terminated, truncated, info)
+        obs = np.zeros(self.observation_space.shape, dtype=np.float32)
+        return obs, 0.0, False, False, {}
+        
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed) # Set seed
+        # Return (obs, info)
+        obs = np.zeros(self.observation_space.shape, dtype=np.float32)
+        return obs, {}
 
 
 class CustomImageDataset(Dataset):
@@ -152,8 +166,9 @@ class SenderAgent:
         self.feedback_host = FEEDBACK_HOST
         self.feedback_port = FEEDBACK_PORT
         
-        self.action_semantic = ACTION_SEMANTIC
+        self.action_semantic_local = ACTION_SEMANTIC_LOCAL
         self.action_raw = ACTION_RAW
+        self.action_semantic_edge = ACTION_SEMANTIC_EDGE
         
         self.state_low = STATE_SPACE_LOW
         self.state_high = STATE_SPACE_HIGH
@@ -166,43 +181,35 @@ class SenderAgent:
         self.feedback_queue = queue.Queue()
         
         # --- Aggregate Stats ---
-        self.semantic_count = 0
+        self.semantic_local_count = 0
         self.raw_count = 0
+        self.semantic_edge_count = 0
 
+from utils.models import PretrainedMobileNetEncoder # Import custom Encoder
+# ...
         # --- Initialize Feature Extractor (Encoder) ---
-        logging.info("Initializing Custom Encoder...")
-        self.feature_extractor = Encoder(encoded_space_dim=512)
+        logging.info("Initializing Custom Encoder (MobileNetV3/Local)...")
+        # Use MobileNetV3 for local processing
+        self.feature_extractor = PretrainedMobileNetEncoder(encoded_space_dim=512)
         
         # Load pre-trained weights if available
-        ae_weights_path = "/app/models/autoencoder_cifar10.pth"
+        ae_weights_path = "/app/models/mobilenet_encoder.pth"
         if os.path.exists(ae_weights_path):
-            logging.info(f"Loading pre-trained Autoencoder weights from {ae_weights_path}...")
+            logging.info(f"Loading MobileNet weights from {ae_weights_path}...")
             try:
                 state_dict = torch.load(ae_weights_path, map_location='cpu')
-                # Filter for encoder keys only (prefix 'encoder_')
-                # Our Encoder class keys match the Autoencoder's keys if we strip nothing, 
-                # BUT the Autoencoder class has 'encoder' submodule.
-                # Let's check how Autoencoder is defined in models.py.
-                # It has self.encoder = Encoder(). So keys will be 'encoder.encoder_cnn.0.weight' etc.
-                # The Encoder class expects 'encoder_cnn.0.weight'.
-                # So we need to strip 'encoder.' prefix.
-                
-                encoder_state_dict = {k.replace('encoder.', ''): v for k, v in state_dict.items() if k.startswith('encoder.')}
-                self.feature_extractor.load_state_dict(encoder_state_dict)
+                # No prefix issues this time, we save state_dict directly from model
+                self.feature_extractor.load_state_dict(state_dict)
                 logging.info("Encoder weights loaded successfully.")
             except Exception as e:
                 logging.error(f"Failed to load encoder weights: {e}")
         else:
-            logging.warning("No pre-trained weights found. Using random initialization.")
-        # Load pre-trained weights if available, otherwise random init is fine for DRL to learn?
-        # Ideally we should pre-train the AE. For now, we use random init and let DRL learn?
-        # No, DRL learns the policy, not the AE. 
-        # The AE should be pre-trained OR trained online. 
-        # For this emulation, let's assume random init is "untrained" or load if exists.
-        # We will just use random init for now as per plan.
+            logging.warning("No pre-trained weights found. Using random/imagenet weights.")
+
+        # IMPORTANT: MobileNet expects 224x224
         self.feature_extractor.eval()
         self.preprocess = transforms.Compose([
-            transforms.Resize((32, 32)),
+            transforms.Resize((224, 224)), # Resize for MobileNet
             transforms.ToTensor(),
         ])
 
@@ -256,6 +263,11 @@ class SenderAgent:
                 n_envs=1,
                 optimize_memory_usage=False
             )
+        
+        # FIX: Manually configure logger to avoid '_logger' or 'logger' attribute errors during manual train() calls
+        from stable_baselines3.common.logger import configure
+        new_logger = configure("/app/runs/sender_logs", ["stdout", "tensorboard"])
+        self.model.set_logger(new_logger)
 
     def _get_image_feature_vector(self, img: Image.Image) -> np.ndarray:
         """Extracts feature vector from a PIL Image using the Encoder."""
@@ -314,6 +326,34 @@ class SenderAgent:
         sock.sendall(msg_len_header)
         sock.sendall(message_payload)
 
+    def _get_edge_feature_vector(self, img: Image.Image) -> np.ndarray:
+        """Extracts feature vector using the Edge Encoder service."""
+        try:
+            # Convert image to bytes
+            img_byte_arr = io.BytesIO()
+            img.save(img_byte_arr, format='JPEG')
+            img_bytes = img_byte_arr.getvalue()
+            
+            # Send POST request
+            response = requests.post(
+                "http://edge-encoder:8000/encode",
+                files={"file": ("image.jpg", img_bytes, "image/jpeg")}
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                vector = np.array(data['vector'], dtype=np.float32)
+                return vector
+            else:
+                logging.error(f"Edge Encoder failed: {response.text}")
+                # Fallback to local encoder or random?
+                # For now, let's fallback to local to avoid crash, but log error
+                return self._get_image_feature_vector(img)
+                
+        except Exception as e:
+            logging.error(f"Error calling Edge Encoder: {e}")
+            return self._get_image_feature_vector(img)
+
     def _create_message_payload(self, action: int) -> Tuple[Dict[str, Any], str]:
         """
         Creates the message dictionary based on the agent's action.
@@ -346,13 +386,21 @@ class SenderAgent:
             'gt_image': gt_image_bytes # Send GT Image for reconstruction loss
         }
 
-        if action == self.action_semantic:
-            self.semantic_count += 1
-            message_dict['type'] = 'SEM'
+        if action == self.action_semantic_local:
+            self.semantic_local_count += 1
+            message_dict['type'] = 'SEM_LOCAL'
             # Send the semantic vector (compressed)
             vector = self._get_image_feature_vector(img)
             message_dict['payload'] = vector
-            log_msg_type = "SEMANTIC"
+            log_msg_type = "SEM_LOCAL"
+
+        elif action == self.action_semantic_edge:
+            self.semantic_edge_count += 1
+            message_dict['type'] = 'SEM_EDGE'
+            # Send the semantic vector from Edge service
+            vector = self._get_edge_feature_vector(img)
+            message_dict['payload'] = vector
+            log_msg_type = "SEM_EDGE"
             
         else:  # ACTION_RAW
             self.raw_count += 1
@@ -393,7 +441,8 @@ class SenderAgent:
                     message_payload_bytes = pickle.dumps(message_dict)
                     
                     logging.info(f"Step {step}: State={np.round(state, 2)}")
-                    logging.info(f"  -> Action: {log_msg_type}")
+                    logging.info(f"  -> Action Int: {action}, Epsilon: {getattr(self.model, 'exploration_rate', 'N/A')}")
+                    logging.info(f"  -> Action Type: {log_msg_type}")
                     self._send_message(s, message_payload_bytes)
                     
                     # 3. SENDER: Receive Feedback
@@ -416,13 +465,20 @@ class SenderAgent:
                     
                     # Train the agent
                     if step > self.learning_starts:
-                        self.model.train(gradient_steps=1)
+                        try:
+                            self.model.train(gradient_steps=1)
+                        except Exception as e:
+                            logging.error(f"Error during model.train() at step {step}: {e}")
+                            logging.error("Continuing without training for this step...")
                     
                     if step % 100 == 0:
-                        total_sent = self.semantic_count + self.raw_count
-                        sem_pct = (self.semantic_count / total_sent) * 100 if total_sent > 0 else 0
+                        total_sent = self.semantic_local_count + self.raw_count + self.semantic_edge_count
+                        sem_local_pct = (self.semantic_local_count / total_sent) * 100 if total_sent > 0 else 0
+                        sem_edge_pct = (self.semantic_edge_count / total_sent) * 100 if total_sent > 0 else 0
+                        raw_pct = (self.raw_count / total_sent) * 100 if total_sent > 0 else 0
+                        
                         logging.info(f"--- Step {step}, Last Reward: {reward:.3f} ---")
-                        logging.info(f"--- Aggregate Stats: Total={total_sent}, SEM={self.semantic_count} ({sem_pct:.1f}%), RAW={self.raw_count} ---")
+                        logging.info(f"--- Stats: Total={total_sent}, LOCAL={self.semantic_local_count} ({sem_local_pct:.1f}%), EDGE={self.semantic_edge_count} ({sem_edge_pct:.1f}%), RAW={self.raw_count} ({raw_pct:.1f}%) ---")
                         self.model.save(f"/app/models/drl_agent_checkpoint_{step}")
 
         except socket.error as e:
@@ -430,12 +486,16 @@ class SenderAgent:
         except Exception as e:
             logging.error(f"An error occurred in the main loop: {e}. Exiting.")
         finally:
-            total_sent = self.semantic_count + self.raw_count
-            sem_pct = (self.semantic_count / total_sent) * 100 if total_sent > 0 else 0
+            total_sent = self.semantic_local_count + self.raw_count + self.semantic_edge_count
+            sem_local_pct = (self.semantic_local_count / total_sent) * 100 if total_sent > 0 else 0
+            sem_edge_pct = (self.semantic_edge_count / total_sent) * 100 if total_sent > 0 else 0
+            raw_pct = (self.raw_count / total_sent) * 100 if total_sent > 0 else 0
+            
             logging.info("Training finished. Saving final model.")
             logging.info(f"=== FINAL STATS === Total Steps: {total_sent}")
-            logging.info(f"=== SEMANTIC: {self.semantic_count} ({sem_pct:.1f}%)")
-            logging.info(f"=== RAW: {self.raw_count} ({100-sem_pct:.1f}%)")
+            logging.info(f"=== LOCAL: {self.semantic_local_count} ({sem_local_pct:.1f}%)")
+            logging.info(f"=== EDGE: {self.semantic_edge_count} ({sem_edge_pct:.1f}%)")
+            logging.info(f"=== RAW: {self.raw_count} ({raw_pct:.1f}%)")
             self.model.save("/app/models/drl_agent_final")
 
 if __name__ == "__main__":
